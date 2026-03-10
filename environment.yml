@@ -13,3 +13,4 @@ dependencies:
   - pip
   - pip:
     - -e ../taturtle
+    - -e ../squirrel

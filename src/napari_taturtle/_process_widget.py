@@ -19,7 +19,8 @@ from qtpy.QtWidgets import (
     QTabWidget,
     QGroupBox,
     QLabel,
-    QFormLayout
+    QFormLayout,
+    QMessageBox
 )
 
 from napari_taturtle.resources import ICON_TATURTLE
@@ -94,6 +95,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
 
     n_images = len(list(image_folder_path.glob('*.tif*')))
     yield {UpdateType.N_IMAGES: n_images}
+    displacements = []
 
     if crop:
         yield {UpdateType.AUTOCROP: True}
@@ -147,6 +149,10 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 template.init_y,
                 pos_x2,
                 pos_y2,
+            )
+            displacements.append(
+                f"Slice {i + 1} ({template.tiff_files[i].name}): "
+                f"Shift X={shift_x}, Shift Y={shift_y}"
             )
             logger.info(
                 f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
@@ -204,6 +210,10 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 pos_x2,
                 pos_y2,
             )
+            displacements.append(
+                f"Slice {i + 1} ({template.tiff_files[i].name}): "
+                f"Shift X={shift_x2}, Shift Y={shift_y2}"
+            )
             logger.info(
                 f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
                 f"{shift_x2} - {shift_y2}"
@@ -223,7 +233,19 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
         if subfolder.exists():
             shutil.rmtree(subfolder)
 
+    # Save displacement report
+    if displacements:
+        report_path = output_base_path / "displacements.txt"
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("Taturtle Alignment Report\n")
+            f.write("=" * 25 + "\n")
+            f.write(f"Reference Image: {image_ref.name}\n")
+            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            f.write("\n".join(displacements))
+            f.write("\n")
+
     yield {UpdateType.DONE}
+    return time.time() - start
     
 
 
@@ -245,7 +267,6 @@ class ProcessWidget(QWidget):
         self.setLayout(QVBoxLayout())
         
         self.setMinimumWidth(200)
-        self.setMaximumHeight(720)
 
         ###############################
         # add banner
@@ -300,6 +321,8 @@ class ProcessWidget(QWidget):
         self.sample_image = None
         #self.n_im = 0
         self.load_from_disk = False
+        self.image_files = []
+        self.image_reference_index = 0
         #self.scale = None
 
         # actions
@@ -353,9 +376,24 @@ class ProcessWidget(QWidget):
         self._nr_cpu  = create_widget(annotation=int, widget_type='SpinBox', value=2, label='Nr CPU')
         self._output_folder = FolderWidget('Choose Output')
 
+        # Navigation buttons
+        self._prev_button = QPushButton('⏴')
+        self._next_button = QPushButton('⏵')
+        self._prev_button.setEnabled(False)
+        self._next_button.setEnabled(False)
+        self._slice_label = QLabel('Slice: -/-')
+        self._slice_label.setAlignment(Qt.AlignCenter)
+
+        nav_layout = QHBoxLayout()
+        nav_layout.addWidget(self._prev_button)
+        nav_layout.addWidget(self._slice_label)
+        nav_layout.addWidget(self._next_button)
+
         formLayout = QFormLayout()
         # magicgui widgets hold the Qt widget at `widget.native`
         formLayout.addRow('Rectangle Layer', self._layer_combo.native)
+        formLayout.addRow('Images Folder', self.images_folder)
+        formLayout.addRow('', nav_layout)
         formLayout.addRow('Output Folder', self._output_folder)
         formLayout.addRow('Crop', self._enable_crop.native)
         formLayout.addRow('Thickness correction', self._enable_thickness_correction.native)
@@ -379,7 +417,6 @@ class ProcessWidget(QWidget):
         self.process_group = QGroupBox()
         self.process_group.setTitle("Process")
         self.process_group.setMinimumWidth(80)
-        self.process_group.setMaximumHeight(100)
         self.process_group.setLayout(QVBoxLayout())
         process_buttons = QWidget()
 
@@ -429,19 +466,55 @@ class ProcessWidget(QWidget):
         self.viewer.layers.events.inserted.connect(self._on_insert_layer)    
         self.viewer.layers.events.removed.connect(self._on_insert_layer)
         self.process_button.clicked.connect(self._start_process)
+        self._prev_button.clicked.connect(self._prev_slice)
+        self._next_button.clicked.connect(self._next_slice)
 
     def _update_image(self):
-        def add_image(widget, image):
+        path = self.images_folder.get_folder()
+
+        if path and path != '':
+            folder_path = Path(path)
+            self.image_files = sorted([f for f in folder_path.glob('*.tif*')])
+            self.image_reference_index = 0
+            self._display_current_slice()
+        else:
+            self.image_files = []
+            self._update_nav_controls()
+
+    def _update_nav_controls(self):
+        n_files = len(self.image_files)
+        if n_files > 0:
+            self._slice_label.setText(f'Slice: {self.image_reference_index + 1}/{n_files}')
+            self._prev_button.setEnabled(self.image_reference_index > 0)
+            self._next_button.setEnabled(self.image_reference_index < n_files - 1)
+        else:
+            self._slice_label.setText('Slice: -/-')
+            self._prev_button.setEnabled(False)
+            self._next_button.setEnabled(False)
+
+    def _next_slice(self):
+        if self.image_files and self.image_reference_index < len(self.image_files) - 1:
+            self.image_reference_index += 1
+            self._display_current_slice()
+
+    def _prev_slice(self):
+        if self.image_files and self.image_reference_index > 0:
+            self.image_reference_index -= 1
+            self._display_current_slice()
+
+    def _display_current_slice(self):
+        if not self.image_files:
+            return
+
+        path = self.image_files[self.image_reference_index]
+        
+        def update_viewer(widget, image):
             if image is not None:
                 if SAMPLE in widget.viewer.layers:
-                    widget.viewer.layers.remove(SAMPLE)
-
-                widget.viewer.add_image(image, name=SAMPLE, visible=True)
-
-                # update the axes widget
-                #widget.axes_widget.update_axes_number(len(image.shape))
-                #widget.axes_widget.set_text_field(widget.axes_widget.get_default_text())
-
+                    widget.viewer.layers[SAMPLE].data = image
+                else:
+                    widget.viewer.add_image(image, name=SAMPLE, visible=True)
+                
                 # Check if any Shapes layer exists
                 shapes_layer = None
                 for layer in widget.viewer.layers:
@@ -451,25 +524,18 @@ class ProcessWidget(QWidget):
 
                 # If no Shapes layer found, create a new one
                 if shapes_layer is None:
-                    shapes_layer = widget.viewer.add_shapes(
+                    widget.viewer.add_shapes(
                         data=[],  # Start with empty shapes
                         shape_type='polygon',  # or 'rectangle', 'line', etc.
                         edge_color='blue',
                         face_color='transparent',
                         name='Select Fiducial Mark'
                     )
+                widget._update_nav_controls()
 
-        
-
-
-
-        path = self.images_folder.get_folder()
-
-        if path is not None and path != '':
-            # load one image
-            load_worker = loading_worker.loading_worker(path)
-            load_worker.yielded.connect(lambda x: add_image(self, x))
-            load_worker.start()
+        load_worker = loading_worker.loading_worker(path)
+        load_worker.yielded.connect(lambda x: update_viewer(self, x))
+        load_worker.start()
 
         
 
@@ -523,12 +589,14 @@ class ProcessWidget(QWidget):
         max_x = int(max_x)
 
         image_folder_path = Path(self.images_folder.get_folder())
-        image_files = [f for f in image_folder_path.glob('*.tif*')]
+        if not self.image_files:
+            self.image_files = sorted([f for f in image_folder_path.glob('*.tif*')])
+        
+        if not self.image_files:
+             ntf.show_info("No TIFF images found in selected folder.")
+             return
 
-        # TODO Make it changeable with button and save the index
-        image_reference_index = 0
-
-        image_reference_path = image_files[0]
+        image_reference_path = self.image_files[self.image_reference_index]
         # image_ref = image_reference_path#.name
 
         # Output folder
@@ -625,9 +693,22 @@ class ProcessWidget(QWidget):
             self.pb_processing.setValue(100)
             self.pb_processing.setFormat(f'Processing done')
     
-    def _done(self):
+    def _done(self, elapsed_time):
         self.state = State.IDLE
         self.process_button.setText('Process again')
+
+        # Format time
+        seconds = int(elapsed_time)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        seconds = seconds % 60
+        time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+        QMessageBox.information(
+            self,
+            "Process Finished",
+            f"Registration completed successfully!\n\nTotal elapsed time: {time_str}"
+        )
 
         '''
         if self.denoi_prediction is not None:
