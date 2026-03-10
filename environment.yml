@@ -1,0 +1,15 @@
+name: napari-taturtle-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - napari
+  - pyqt
+  - numpy
+  - scikit-image
+  - magicgui
+  - qtpy
+  - tifffile
+  - pip
+  - pip:
+    - -e ../taturtle

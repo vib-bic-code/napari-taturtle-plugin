@@ -1,0 +1,41 @@
+name: napari-taturtle
+display_name: Taturtle
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/technical_references/manifest.html#fields for valid categories
+categories: ["Transformations", "Image Processing"]
+contributions:
+  commands:
+    - id: napari-taturtle.get_reader
+      python_name: napari_taturtle._reader:napari_get_reader
+      title: Open data with Taturtle
+    - id: napari-taturtle.write_multiple
+      python_name: napari_taturtle._writer:write_multiple
+      title: Save multi-layer data with Taturtle
+    - id: napari-taturtle.write_single_image
+      python_name: napari_taturtle._writer:write_single_image
+      title: Save image data with Taturtle
+    - id: napari-taturtle.make_sample_data
+      python_name: napari_taturtle._sample_data:make_sample_data
+      title: Load sample data from Taturtle
+    - id: napari-taturtle.make_taturle_processwidget
+      python_name: napari_taturtle._process_widget:ProcessWidgetWrapper
+      title: Taturtle Registration
+  readers:
+    - command: napari-taturtle.get_reader
+      accepts_directories: false
+      filename_patterns: ['*.npy']
+  writers:
+    - command: napari-taturtle.write_multiple
+      layer_types: ['image*','labels*']
+      filename_extensions: []
+    - command: napari-taturtle.write_single_image
+      layer_types: ['image']
+      filename_extensions: ['.npy']
+  sample_data:
+    - command: napari-taturtle.make_sample_data
+      display_name: Taturtle
+      key: unique_id.1
+  widgets:
+    - command: napari-taturtle.make_taturle_processwidget
+      display_name: Process Widget
