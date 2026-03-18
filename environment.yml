@@ -12,5 +12,5 @@ dependencies:
   - tifffile
   - pip
   - pip:
-    - -e git+https://github.com/vib-bic-code/taturtle
-    - -e git+https://github.com/jhennies/squirrel
+    - git+https://github.com/vib-bic-code/taturtle
+    - git+https://github.com/jhennies/squirrel
