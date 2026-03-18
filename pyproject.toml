@@ -32,7 +32,7 @@ dependencies = [
     "qtpy",
     "scikit-image",
     "tifffile",
-    "taturtle @ file:///c:/Users/u0094799/Documents/PROJECTS/Both/taturtle"
+    "taturtle"
 ]
 
 [project.optional-dependencies]
