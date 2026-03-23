@@ -10,7 +10,10 @@ dependencies:
   - magicgui
   - qtpy
   - tifffile
+  - h5py
+  - scipy
   - pip
   - pip:
+    - simpleitk
     - -e ../taturtle
     - -e ../squirrel

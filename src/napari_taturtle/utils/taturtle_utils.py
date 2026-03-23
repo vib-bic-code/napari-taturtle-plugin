@@ -11,5 +11,6 @@ class UpdateType(Enum):
     AUTOCROP = 'autocrop'
     THICKNESS = 'thickness'
     DONE = 'done'
+    AMST2 = 'amst2'
     CRASHED = 'crashed'
     FAILED = 'failed'

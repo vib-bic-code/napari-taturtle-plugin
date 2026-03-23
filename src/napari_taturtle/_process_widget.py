@@ -20,7 +20,10 @@ from qtpy.QtWidgets import (
     QGroupBox,
     QLabel,
     QFormLayout,
-    QMessageBox
+    QMessageBox,
+    QLineEdit,
+    QSpinBox,
+    QDoubleSpinBox
 )
 
 from napari_taturtle.resources import ICON_TATURTLE
@@ -68,8 +71,16 @@ SAMPLE = 'Sample data'
 @thread_worker
 def _process_worker(min_x, max_x, min_y, max_y, image_folder_path, 
                     image_ref, crop, thickness_correction, alpha,
-                    search_window, nr_cpu, slice_thickness, output_base_path):
+                    search_window, nr_cpu, slice_thickness, output_base_path,
+                    enable_amst2=False, amst2_settings=None):
     import shutil
+    import tempfile
+    import os
+    from squirrel.workflows.elastix import (
+        make_elastix_default_parameter_file_workflow,
+        apply_multi_step_stack_alignment_workflow
+    )
+    from squirrel.workflows.amst import amst_workflow
     print(f"min_y: {min_y}")
     print(f"min_x: {min_x}")
     print(f"max_y: {max_y}")
@@ -244,8 +255,52 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
             f.write("\n".join(displacements))
             f.write("\n")
 
+    if enable_amst2 and amst2_settings:
+        yield {UpdateType.AMST2: "AMST2 Phase 1: Generating parameters..."}
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
+            tmp_params_path = tmp.name
+        
+        try:
+            make_elastix_default_parameter_file_workflow(
+                tmp_params_path,
+                transform=amst2_settings['transform'],
+                elastix_parameters=amst2_settings['elx_params']
+            )
+            
+            yield {UpdateType.AMST2: "AMST2 Phase 2: Running refinement..."}
+            amst_transform_path = output_base_path / "amst_transforms.json"
+            amst_workflow(
+                pre_aligned_stack=str(output_base_path),
+                out_filepath=str(amst_transform_path),
+                elastix_parameters=tmp_params_path,
+                gaussian_sigma=amst2_settings['sigma'],
+                transform="bspline",
+                median_radius=amst2_settings['radius'],
+                n_workers=nr_cpu
+            )
+            
+            yield {UpdateType.AMST2: "AMST2 Phase 3: Applying alignment..."}
+            refinement_folder = output_base_path / "refinement"
+            refinement_folder.mkdir(parents=True, exist_ok=True)
+            
+            apply_multi_step_stack_alignment_workflow(
+                image_stack=str(output_base_path),
+                transform_paths=[str(amst_transform_path)],
+                out_filepath=str(refinement_folder),
+                auto_pad=True,
+                n_workers=nr_cpu,
+                write_result=True
+            )
+        finally:
+            if os.path.exists(tmp_params_path):
+                try:
+                    os.remove(tmp_params_path)
+                except:
+                    pass
+
+    elapsed_time = time.time() - start
     yield {UpdateType.DONE}
-    return time.time() - start
+    return elapsed_time
     
 
 
@@ -400,6 +455,30 @@ class ProcessWidget(QWidget):
         formLayout.addRow('Search Window', self._search_windows.native)
         formLayout.addRow('Slice Thickness', self._slice_thickness.native)
         formLayout.addRow('Nr CPU', self._nr_cpu.native)
+
+        # AMST2 Refinement
+        self._enable_amst2 = QCheckBox("Add AMST2 Refinement")
+        self._amst2_panel = QGroupBox("AMST2 Parameters")
+        amst2_form = QFormLayout()
+        
+        self._amst2_transform = QLineEdit("amst2-bspline")
+        self._amst2_elx_params = QLineEdit("FinalGridSpacingInPhysicalUnits:128 GridSpacingSchedule:2.0,1.4,1.2,1.0")
+        self._amst2_gaussian_sigma = QDoubleSpinBox()
+        self._amst2_gaussian_sigma.setValue(2.0)
+        self._amst2_median_radius = QSpinBox()
+        self._amst2_median_radius.setValue(7)
+        
+        amst2_form.addRow("Transform", self._amst2_transform)
+        amst2_form.addRow("Elastix Params", self._amst2_elx_params)
+        amst2_form.addRow("Gaussian Sigma", self._amst2_gaussian_sigma)
+        amst2_form.addRow("Median Radius", self._amst2_median_radius)
+        self._amst2_panel.setLayout(amst2_form)
+        self._amst2_panel.setVisible(False)
+        
+        self._enable_amst2.toggled.connect(self._amst2_panel.setVisible)
+        
+        formLayout.addRow('', self._enable_amst2)
+        formLayout.addRow('', self._amst2_panel)
    
 
         #self.layout().addLayout(formLayout)   
@@ -572,6 +651,15 @@ class ProcessWidget(QWidget):
         else:
             nr_cpu = 2
 
+        # AMST2 params
+        enable_amst2 = self._enable_amst2.isChecked()
+        amst2_settings = {
+            'transform': self._amst2_transform.text(),
+            'elx_params': self._amst2_elx_params.text().split(),
+            'sigma': self._amst2_gaussian_sigma.value(),
+            'radius': self._amst2_median_radius.value()
+        }
+
         layer_shape= self._layer_combo.value
 
         if layer_shape.data is None or len(layer_shape.data) != 1:
@@ -609,7 +697,8 @@ class ProcessWidget(QWidget):
         self.worker = _process_worker(
             min_x, max_x, min_y, max_y, image_folder_path, 
             image_reference_path, crop, thickness_correction, alpha,
-            search_window, nr_cpu, slice_thickness, output_base_path
+            search_window, nr_cpu, slice_thickness, output_base_path,
+            enable_amst2, amst2_settings
         )
         
         self.worker.yielded.connect(lambda x: self._update(x))
@@ -688,6 +777,10 @@ class ProcessWidget(QWidget):
             self.pb_processing.setValue(perc)
             self.pb_processing.setFormat(f'Processing {val}/{self.n_im}')
             # self.viewer.layers[DENOISING].refresh()
+
+        if UpdateType.AMST2 in updates:
+            self.pb_processing.setValue(100)
+            self.pb_processing.setFormat(updates[UpdateType.AMST2])
 
         if UpdateType.DONE in updates:
             self.pb_processing.setValue(100)
