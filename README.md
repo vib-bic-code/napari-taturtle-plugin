@@ -18,7 +18,9 @@ conda env create -f environment.yml
 conda activate napari-taturtle-env
 ```
 
-### 2. Install the Plugin in Editable Mode
+### 2. Clone the project
+
+### 3. Install the Plugin in Editable Mode
 From the root of this project directory:
 
 ```bash

@@ -15,5 +15,5 @@ dependencies:
   - pip
   - pip:
     - simpleitk
-    - -e ../taturtle
-    - -e ../squirrel
+    - git+https://github.com/vib-bic-code/taturtle
+    - git+https://github.com/jhennies/squirrel
