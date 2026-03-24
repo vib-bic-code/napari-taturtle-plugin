@@ -38,4 +38,4 @@ contributions:
       key: unique_id.1
   widgets:
     - command: napari-taturtle.make_taturle_processwidget
-      display_name: Process Widget
+      display_name: Registration

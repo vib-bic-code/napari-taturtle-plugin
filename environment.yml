@@ -12,8 +12,9 @@ dependencies:
   - tifffile
   - h5py
   - scipy
+  - matplotlib
   - pip
   - pip:
-    - simpleitk
+    - SimpleITK-SimpleElastix
     - git+https://github.com/vib-bic-code/taturtle
     - git+https://github.com/jhennies/squirrel

@@ -1,5 +1,3 @@
-"""
-"""
 
 import logging
 from pathlib import Path
@@ -43,6 +41,7 @@ from napari_taturtle.widgets import (
 )
 
 
+import os
 import logging
 import time
 from pathlib import Path
@@ -62,6 +61,7 @@ from taturtle.utils import arguments_parser
 from napari.qt.threading import thread_worker
 
 from napari_taturtle.utils.taturtle_utils import UpdateType
+from napari_taturtle.utils.visualization import plot_displacements
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +75,17 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                     enable_amst2=False, amst2_settings=None):
     import shutil
     import tempfile
-    import os
     from squirrel.workflows.elastix import (
         make_elastix_default_parameter_file_workflow,
         apply_multi_step_stack_alignment_workflow
     )
-    from squirrel.workflows.amst import amst_workflow
+    from squirrel.library.io import load_data_handle
+    from squirrel.library.data import norm_z_range
+    from squirrel.library.elastix import register_with_elastix, ElastixStack
+    from squirrel.workflows.amst import _z_smooth
+    import multiprocessing as mp
+    from multiprocessing.pool import ThreadPool
+    import sys
     print(f"min_y: {min_y}")
     print(f"min_x: {min_x}")
     print(f"max_y: {max_y}")
@@ -179,6 +184,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
         logger.info(
             f"Before {len_input_files}, After {len_slices} Thickness correction passed"
         )
+        yield {UpdateType.N_IMAGES: len_slices}
         image_folder_path = thickness_corr_folder_path
         image_ref = image_folder_path / f"{image_ref.stem}_0.tif"
         if not image_ref.exists():
@@ -255,8 +261,9 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
             f.write("\n".join(displacements))
             f.write("\n")
 
+    final_results_path = output_base_path
     if enable_amst2 and amst2_settings:
-        yield {UpdateType.AMST2: "AMST2 Phase 1: Generating parameters..."}
+        yield {UpdateType.AMST2: (0, "AMST Phase 1: Generating parameters...")}
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
             tmp_params_path = tmp.name
         
@@ -267,22 +274,76 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 elastix_parameters=amst2_settings['elx_params']
             )
             
-            yield {UpdateType.AMST2: "AMST2 Phase 2: Running refinement..."}
+            yield {UpdateType.AMST2: "AMST Phase 2: Running refinement..."}
             amst_transform_path = output_base_path / "amst_transforms.json"
-            amst_workflow(
-                pre_aligned_stack=str(output_base_path),
-                out_filepath=str(amst_transform_path),
-                elastix_parameters=tmp_params_path,
-                gaussian_sigma=amst2_settings['sigma'],
-                transform="bspline",
-                median_radius=amst2_settings['radius'],
-                n_workers=nr_cpu
-            )
             
-            yield {UpdateType.AMST2: "AMST2 Phase 3: Applying alignment..."}
+            # Replicating amst_workflow logic to provide progress reporting
+            yield {UpdateType.AMST2: (0, "AMST: Loading stack...")}
+            handle, stack_shape = load_data_handle(str(output_base_path))
+            
+            yield {UpdateType.AMST2: (0, "AMST: Computing median template...")}
+            # Compute median smoothed template (mst)
+            radius = amst2_settings['radius']
+            # We load the full stack into memory for smoothing (same as amst_workflow)
+            stack_data = handle[:]
+            mst = _z_smooth(stack_data, median_radius=radius, method='median')
+            
+            yield {UpdateType.AMST2: (0, "AMST: Starting slice registration...")}
+            
+            # Setup registration tasks
+            transform_type = amst2_settings['transform']
+            sigma = amst2_settings['sigma']
+            
+            tasks = []
+            pool = ThreadPool(nr_cpu)
+            
+            for zidx in range(len(stack_data)):
+                tasks.append(pool.apply_async(
+                    register_with_elastix,
+                    (mst[zidx], stack_data[zidx]),
+                    dict(
+                        transform=transform_type,
+                        automatic_transform_initialization=False,
+                        parameter_map=tmp_params_path,
+                        gaussian_sigma=sigma,
+                        normalize_images=False,
+                        n_workers=1,
+                        verbose=False
+                    )
+                ))
+                
+            pool.close()
+            
+            result_stack = []
+            for i, task in enumerate(tasks):
+                result_stack.append(task.get())
+                perc = int(100 * (i + 1) / len(tasks))
+                yield {UpdateType.AMST2: (perc, f"AMST: Registering slice {i+1}/{len(tasks)}")}
+            
+            pool.join()
+            
+            # Package into appropriate stack type
+            if transform_type in ['bspline', 'BSplineTransform']:
+                from squirrel.library.elastix import ElastixStack
+                result_transforms = ElastixStack()
+                for res in result_stack:
+                    result_transforms.append(res[0])
+            else:
+                from squirrel.library.affine_matrices import AffineStack
+                result_transforms = AffineStack(is_sequenced=True, pivot=[0., 0.])
+                for res in result_stack:
+                    result_transforms.append(res[0])
+            
+            # Save final results
+            result_transforms.to_file(str(amst_transform_path))
+            
+            yield {UpdateType.AMST2: "AMST Phase 3: Plotting displacements..."}
+            plot_path = output_base_path / "amst_displacements.png"
+            plot_displacements(str(amst_transform_path), str(plot_path))
+            
+            yield {UpdateType.AMST2: "AMST Phase 4: Applying alignment..."}
             refinement_folder = output_base_path / "refinement"
             refinement_folder.mkdir(parents=True, exist_ok=True)
-            
             apply_multi_step_stack_alignment_workflow(
                 image_stack=str(output_base_path),
                 transform_paths=[str(amst_transform_path)],
@@ -291,6 +352,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 n_workers=nr_cpu,
                 write_result=True
             )
+            final_results_path = refinement_folder
         finally:
             if os.path.exists(tmp_params_path):
                 try:
@@ -300,7 +362,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
 
     elapsed_time = time.time() - start
     yield {UpdateType.DONE}
-    return elapsed_time
+    return elapsed_time, final_results_path
     
 
 
@@ -331,11 +393,6 @@ class ProcessWidget(QWidget):
                                              'https://github.com/vib-bic-code/napari-taturtle',
                                              'https://github.com/vib-bic-code/napari-taturtle/issues'))
 
-        # add GPU button
-        #gpu_button = create_gpu_label()
-        #gpu_button.setAlignment(Qt.AlignmentFlag.AlignRight)
-        #self.layout().addWidget(gpu_button)
-
         # QTabs
         self.tabs = QTabWidget()
         tab_layers = QWidget()
@@ -354,55 +411,32 @@ class ProcessWidget(QWidget):
         tab_layers.layout().addWidget(self.images.native)
 
         # disk tab
-        #self.lazy_loading = QCheckBox('Lazy loading')
-        #tab_disk.layout().addWidget(self.lazy_loading)
         self.images_folder = FolderWidget('Choose')
         tab_disk.layout().addWidget(self.images_folder)
 
         # add to main layout
         self.layout().addWidget(self.tabs)
-
-        
-        #self.images.choices = [x for x in self.viewer.layers if type(x) is napari.layers.Image]
         
 
         ###############################
         self._build_params_widgets()
-        #self._build_processing_widgets()
 
         # place holders
         self.worker = None
-        #self.denoi_prediction = None
         self.sample_image = None
-        #self.n_im = 0
+        self.n_im = 1
         self.load_from_disk = False
         self.image_files = []
         self.image_reference_index = 0
-        #self.scale = None
 
-        # actions
-        '''
-        self.tabs.currentChanged.connect(self._update_tab_axes)
-        self.predict_button.clicked.connect(self._start_prediction)
-        self.images.changed.connect(self._update_layer_axes)
-        self.images_folder.text_field.textChanged.connect(self._update_disk_axes)
-        self.enable_3d.stateChanged.connect(self._update_3D)
-        self.tiling_cbox.stateChanged.connect(self._update_tiling)
-        '''
         # update image layer
         self.images.choices = [x for x in self.viewer.layers if type(x) is napari.layers.Image]
 
         # Update shapes layer
         self._layer_combo.choices = [y for y in self.viewer.layers if type(y) is napari.layers.Shapes]
 
-
         # actions
         self._set_actions()
-
-        '''
-        # update axes if necessary
-        self._update_layer_axes()
-        '''
 
     def _on_insert_layer(self, event=None):
         """Bind the update of layer choices in dropdowns to the renaming of inserted layers."""
@@ -413,12 +447,7 @@ class ProcessWidget(QWidget):
 
     def _build_params_widgets(self):
         """Builds the parameter widgets for the custom widget."""
-        # Create widgets for parameters
-        # change annotation to napari.layers.Image (e.g) to restrict to just Images
-        #self._layer_combo = create_widget(annotation=napari.layers.Layer)
-
-
-        
+        # Create widgets for parameters        
         self.training_param_group = QGroupBox()
         self.training_param_group.setTitle("Parameters")
         self.training_param_group.setMinimumWidth(100)
@@ -428,7 +457,7 @@ class ProcessWidget(QWidget):
         self._enable_thickness_correction = create_widget(annotation=bool)
         self._search_windows  = create_widget(annotation=int, widget_type='SpinBox', value=100, label='Search Window')
         self._slice_thickness  = create_widget(annotation=int, widget_type='FloatSpinBox', value=1.0, label='Slice Thickness')
-        self._nr_cpu  = create_widget(annotation=int, widget_type='SpinBox', value=2, label='Nr CPU')
+        self._nr_cpu  = create_widget(annotation=int, widget_type='SpinBox', value=max(1, os.cpu_count() - 4), label='Nr CPU')
         self._output_folder = FolderWidget('Choose Output')
 
         # Navigation buttons
@@ -436,18 +465,28 @@ class ProcessWidget(QWidget):
         self._next_button = QPushButton('⏵')
         self._prev_button.setEnabled(False)
         self._next_button.setEnabled(False)
-        self._slice_label = QLabel('Slice: -/-')
-        self._slice_label.setAlignment(Qt.AlignCenter)
+        
+        self._slice_spinbox = QSpinBox()
+        self._slice_spinbox.setMinimum(1)
+        self._slice_spinbox.setEnabled(False)
+        
+        self._slice_label_total = QLabel('/ -')
+        self._slice_label_total.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
         nav_layout = QHBoxLayout()
         nav_layout.addWidget(self._prev_button)
-        nav_layout.addWidget(self._slice_label)
+        
+        slice_label = QLabel('Slice:')
+        slice_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        nav_layout.addWidget(slice_label)
+        nav_layout.addWidget(self._slice_spinbox)
+        nav_layout.addWidget(self._slice_label_total)
         nav_layout.addWidget(self._next_button)
 
         formLayout = QFormLayout()
         # magicgui widgets hold the Qt widget at `widget.native`
-        formLayout.addRow('Rectangle Layer', self._layer_combo.native)
         formLayout.addRow('Images Folder', self.images_folder)
+        formLayout.addRow('Rectangle Layer', self._layer_combo.native)
         formLayout.addRow('', nav_layout)
         formLayout.addRow('Output Folder', self._output_folder)
         formLayout.addRow('Crop', self._enable_crop.native)
@@ -457,11 +496,11 @@ class ProcessWidget(QWidget):
         formLayout.addRow('Nr CPU', self._nr_cpu.native)
 
         # AMST2 Refinement
-        self._enable_amst2 = QCheckBox("Add AMST2 Refinement")
-        self._amst2_panel = QGroupBox("AMST2 Parameters")
+        self._enable_amst2 = QCheckBox("Add AMST Refinement")
+        self._amst2_panel = QGroupBox("AMST Parameters")
         amst2_form = QFormLayout()
         
-        self._amst2_transform = QLineEdit("amst2-bspline")
+        self._amst2_transform = QLineEdit("bspline")
         self._amst2_elx_params = QLineEdit("FinalGridSpacingInPhysicalUnits:128 GridSpacingSchedule:2.0,1.4,1.2,1.0")
         self._amst2_gaussian_sigma = QDoubleSpinBox()
         self._amst2_gaussian_sigma.setValue(2.0)
@@ -479,10 +518,6 @@ class ProcessWidget(QWidget):
         
         formLayout.addRow('', self._enable_amst2)
         formLayout.addRow('', self._amst2_panel)
-   
-
-        #self.layout().addLayout(formLayout)   
-
 
         hlayout = QVBoxLayout()
         hlayout.addLayout(formLayout)
@@ -547,6 +582,14 @@ class ProcessWidget(QWidget):
         self.process_button.clicked.connect(self._start_process)
         self._prev_button.clicked.connect(self._prev_slice)
         self._next_button.clicked.connect(self._next_slice)
+        self._slice_spinbox.valueChanged.connect(self._on_spinbox_changed)
+
+    def _on_spinbox_changed(self, value):
+        if self.image_files:
+            new_index = value - 1
+            if new_index != self.image_reference_index:
+                self.image_reference_index = new_index
+                self._display_current_slice()
 
     def _update_image(self):
         path = self.images_folder.get_folder()
@@ -563,11 +606,18 @@ class ProcessWidget(QWidget):
     def _update_nav_controls(self):
         n_files = len(self.image_files)
         if n_files > 0:
-            self._slice_label.setText(f'Slice: {self.image_reference_index + 1}/{n_files}')
+            self._slice_spinbox.blockSignals(True)
+            self._slice_spinbox.setEnabled(True)
+            self._slice_spinbox.setMaximum(n_files)
+            self._slice_spinbox.setValue(self.image_reference_index + 1)
+            self._slice_spinbox.blockSignals(False)
+            
+            self._slice_label_total.setText(f'/ {n_files}')
             self._prev_button.setEnabled(self.image_reference_index > 0)
             self._next_button.setEnabled(self.image_reference_index < n_files - 1)
         else:
-            self._slice_label.setText('Slice: -/-')
+            self._slice_spinbox.setEnabled(False)
+            self._slice_label_total.setText('/ -')
             self._prev_button.setEnabled(False)
             self._next_button.setEnabled(False)
 
@@ -615,8 +665,6 @@ class ProcessWidget(QWidget):
         load_worker = loading_worker.loading_worker(path)
         load_worker.yielded.connect(lambda x: update_viewer(self, x))
         load_worker.start()
-
-        
 
 
     def _start_process(self):
@@ -706,23 +754,6 @@ class ProcessWidget(QWidget):
 
         self.worker.start()
 
-
-    '''
-    def _update_tiling(self, state):
-        self.tiling_spin.setEnabled(state)
-
-    def _update_3D(self):
-        self.axes_widget.update_is_3D(self.enable_3d.isChecked())
-        self.axes_widget.set_text_field(self.axes_widget.get_default_text())
-
-    def _update_layer_axes(self):
-        if self.images.value is not None:
-            shape = self.images.value.data.shape
-
-            # update shape length in the axes widget
-            self.axes_widget.update_axes_number(len(shape))
-            self.axes_widget.set_text_field(self.axes_widget.get_default_text())
-    '''
     def _add_image(self, image):
         if SAMPLE in self.viewer.layers:
             self.viewer.layers.remove(SAMPLE)
@@ -734,28 +765,6 @@ class ProcessWidget(QWidget):
             # update the axes widget
             self.axes_widget.update_axes_number(len(image.shape))
             self.axes_widget.set_text_field(self.axes_widget.get_default_text())
-    '''
-    def _update_disk_axes(self):
-        path = self.images_folder.get_folder()
-
-        # load one image
-        load_worker = loading_worker(path)
-        load_worker.yielded.connect(lambda x: self._add_image(x))
-        load_worker.start()
-
-    def _update_tab_axes(self):
-        """
-        Updates the axes widget following the newly selected tab.
-
-        :return:
-        """
-        self.load_from_disk = self.tabs.currentIndex() == 1
-
-        if self.load_from_disk:
-            self._update_disk_axes()
-        else:
-            self._update_layer_axes()
-    '''
     
     def _update(self, updates):
         if UpdateType.N_IMAGES in updates:
@@ -779,16 +788,28 @@ class ProcessWidget(QWidget):
             # self.viewer.layers[DENOISING].refresh()
 
         if UpdateType.AMST2 in updates:
-            self.pb_processing.setValue(100)
-            self.pb_processing.setFormat(updates[UpdateType.AMST2])
+            raw_val = updates[UpdateType.AMST2]
+            if isinstance(raw_val, tuple):
+                perc, text = raw_val
+                self.pb_processing.setValue(perc)
+                self.pb_processing.setFormat(text)
+            else:
+                self.pb_processing.setValue(100)
+                self.pb_processing.setFormat(str(raw_val))
 
         if UpdateType.DONE in updates:
             self.pb_processing.setValue(100)
             self.pb_processing.setFormat(f'Processing done')
     
-    def _done(self, elapsed_time):
+    def _done(self, result):
         self.state = State.IDLE
         self.process_button.setText('Process again')
+        
+        if isinstance(result, tuple):
+            elapsed_time, results_path = result
+        else:
+            elapsed_time = result
+            results_path = None
 
         # Format time
         seconds = int(elapsed_time)
@@ -803,104 +824,27 @@ class ProcessWidget(QWidget):
             f"Registration completed successfully!\n\nTotal elapsed time: {time_str}"
         )
 
-        '''
-        if self.denoi_prediction is not None:
-            if self.scale is not None:
-                self.viewer.add_image(
-                    self.denoi_prediction,
-                    name=DENOISING,
-                    scale = self.scale,
-                    visible=True
-                )
-            else:
-                self.viewer.add_image(self.denoi_prediction, name=DENOISING, visible=True)
-        '''
-    '''
-    def _start_prediction(self):
-        if self.state == State.IDLE:
-            if self.axes_widget.is_valid():
-                if self.get_model_path().exists() and self.get_model_path().is_file():
-                    self.state = State.RUNNING
-
-                    self.predict_button.setText('Stop')
-
-                    if DENOISING in self.viewer.layers:
-                        self.viewer.layers.remove(DENOISING)
-
-                    self.denoi_prediction = None
-                    self.worker = prediction_worker(self)
-                    self.worker.yielded.connect(lambda x: self._update(x))
-                    self.worker.returned.connect(self._done)
-                    self.worker.start()
+        if results_path and results_path.exists():
+            load_results = QMessageBox.question(
+                self,
+                "Load Results",
+                "Would you like to open the processed dataset as a stack in Napari?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if load_results == QMessageBox.Yes:
+                files = [str(f) for f in sorted(results_path.glob("*.tif*"))]
+                if files:
+                    self.viewer.open(files, stack=True)
                 else:
-                    # TODO: napari 0.4.16 has ntf.show_error, but napari workflows requires 0.4.15 that doesn't
-                    # ntf.show_error('Select a valid model path')
-                    ntf.show_info('Select a valid model path')
-            else:
-                # TODO: napari 0.4.16 has ntf.show_error, but napari workflows requires 0.4.15 that doesn't
-                # ntf.show_error('Invalid axes')
-                ntf.show_info('Invalid axes')
+                    ntf.show_info("No result images found in the output folder.")
 
-        elif self.state == State.RUNNING:
-            self.state = State.IDLE
-
-    
-    '''
-
-    '''
-    def get_model_path(self):
-        return self.load_model_button.Model.value
-
-    def set_model_path(self, path: Path):
-        self.load_model_button.Model.value = path
-    '''
     def set_layer(self, layer):
         self.images.choices = [x for x in self.viewer.layers if type(x) is napari.layers.Image]
         if layer in self.images.choices:
             self.images.native.value = layer
-    '''
-    # TODO call these methods throughout the workers
-    def get_axes(self):
-        return self.axes_widget.get_axes()
-
-    def is_tiling_checked(self):
-        return self.tiling_cbox.isChecked()
-
-    def get_n_tiles(self):
-        return self.tiling_spin.value()
-    '''
-'''
-class DemoPrediction(PredictWidgetWrapper):
-    def __init__(self, napari_viewer):
-        super().__init__(napari_viewer)
-
-        # dowload demo files
-        from napari_n2v._sample_data import demo_files
-        ntf.show_info('Downloading data can take a few minutes.')
-
-        # get files
-        img, model = demo_files()
-
-        # add image to viewer
-        name = 'Demo image'
-        napari_viewer.add_image(img[0:471, 200:671], name=name)
-
-        # modify path
-        self.widget.set_model_path(model)
-        self.widget.set_layer(name)
-'''
 
 if __name__ == "__main__":
-    #from napari_n2v._sample_data import n2v_2D_data, n2v_3D_data
-
     # create a Viewer
     viewer = napari.Viewer()
-
-    # add our plugin
-    #viewer.window.add_dock_widget(PredictWidgetWrapper(viewer))
-
-    #data = n2v_2D_data()
-    #viewer.add_image(data[0][0][-10:], name=data[0][1]['name'])
-  
-
     napari.run()
