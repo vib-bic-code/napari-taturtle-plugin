@@ -483,17 +483,17 @@ class ProcessWidget(QWidget):
         nav_layout.addWidget(self._slice_label_total)
         nav_layout.addWidget(self._next_button)
 
-        formLayout = QFormLayout()
+        self._params_form = QFormLayout()
         # magicgui widgets hold the Qt widget at `widget.native`
-        formLayout.addRow('Images Folder', self.images_folder)
-        formLayout.addRow('Rectangle Layer', self._layer_combo.native)
-        formLayout.addRow('', nav_layout)
-        formLayout.addRow('Output Folder', self._output_folder)
-        formLayout.addRow('Crop', self._enable_crop.native)
-        formLayout.addRow('Thickness correction', self._enable_thickness_correction.native)
-        formLayout.addRow('Search Window', self._search_windows.native)
-        formLayout.addRow('Slice Thickness', self._slice_thickness.native)
-        formLayout.addRow('Nr CPU', self._nr_cpu.native)
+        self._params_form.addRow('Images Folder', self.images_folder)
+        self._params_form.addRow('Rectangle Layer', self._layer_combo.native)
+        self._params_form.addRow('', nav_layout)
+        self._params_form.addRow('Output Folder', self._output_folder)
+        self._params_form.addRow('Crop', self._enable_crop.native)
+        self._params_form.addRow('Thickness correction', self._enable_thickness_correction.native)
+        self._params_form.addRow('Slice Thickness', self._slice_thickness.native)
+        self._params_form.addRow('Search Window', self._search_windows.native)
+        self._params_form.addRow('Nr CPU', self._nr_cpu.native)
 
         # AMST2 Refinement
         self._enable_amst2 = QCheckBox("Add AMST Refinement")
@@ -516,11 +516,11 @@ class ProcessWidget(QWidget):
         
         self._enable_amst2.toggled.connect(self._amst2_panel.setVisible)
         
-        formLayout.addRow('', self._enable_amst2)
-        formLayout.addRow('', self._amst2_panel)
+        self._params_form.addRow('', self._enable_amst2)
+        self._params_form.addRow('', self._amst2_panel)
 
         hlayout = QVBoxLayout()
-        hlayout.addLayout(formLayout)
+        hlayout.addLayout(self._params_form)
 
         self.training_param_group.setLayout(hlayout)
         self.training_param_group.layout().setContentsMargins(5, 20, 5, 10)
@@ -583,6 +583,16 @@ class ProcessWidget(QWidget):
         self._prev_button.clicked.connect(self._prev_slice)
         self._next_button.clicked.connect(self._next_slice)
         self._slice_spinbox.valueChanged.connect(self._on_spinbox_changed)
+        self._enable_thickness_correction.changed.connect(self._update_thickness_visibility)
+        # Sync initial state
+        self._update_thickness_visibility()
+
+    def _update_thickness_visibility(self, event=None):
+        visible = self._enable_thickness_correction.value
+        self._slice_thickness.native.setVisible(visible)
+        label = self._params_form.labelForField(self._slice_thickness.native)
+        if label:
+            label.setVisible(visible)
 
     def _on_spinbox_changed(self, value):
         if self.image_files:
