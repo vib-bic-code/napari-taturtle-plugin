@@ -20,6 +20,10 @@ conda activate napari-taturtle-env
 
 ### 2. Clone the project
 
+```bash
+git clone https://github.com/vib-bic-code/napari-taturtle-plugin.git
+cd napari-taturtle-plugin
+```
 ### 3. Install the Plugin in Editable Mode
 From the root of this project directory:
 
