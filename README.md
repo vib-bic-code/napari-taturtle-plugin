@@ -10,6 +10,9 @@ A napari plugin for FIB-SEM image alignment and preprocessing, powered by the `t
 
 ## Installation
 
+### 0. Install Conda
+Install conda like with [miniforge](https://github.com/conda-forge/miniforge) or others
+
 ### 1. Create the Conda Environment
 Using the provided `environment.yml` file:
 
