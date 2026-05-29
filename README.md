@@ -2,6 +2,9 @@
 
 A napari plugin for FIB-SEM image alignment and preprocessing, powered by the `taturtle` package.
 
+<img width="1918" height="1029" alt="image" src="https://github.com/user-attachments/assets/64501395-6cf8-4893-9ce7-08a8488fcc7b" />
+
+
 ## Features
 - **Autocrop**: Automatically remove black borders from aligned stacks.
 - **Registration**: High-precision image registration using template matching.
