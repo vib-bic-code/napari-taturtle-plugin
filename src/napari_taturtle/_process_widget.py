@@ -72,7 +72,8 @@ SAMPLE = 'Sample data'
 def _process_worker(min_x, max_x, min_y, max_y, image_folder_path, 
                     image_ref, crop, thickness_correction, alpha,
                     search_window, nr_cpu, slice_thickness, output_base_path,
-                    enable_amst2=False, amst2_settings=None):
+                    enable_amst2=False, amst2_settings=None,
+                    enable_taturtle_alignment=True):
     import shutil
     import tempfile
     from squirrel.workflows.elastix import (
@@ -103,9 +104,10 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
     thickness_corr_folder_path = output_base_path / "thickness_corr"
     cropped_folder_path = output_base_path / "cropped"
 
-    output_folder_path.mkdir(parents=True, exist_ok=True)
-    thickness_corr_folder_path.mkdir(parents=True, exist_ok=True)
-    cropped_folder_path.mkdir(parents=True, exist_ok=True)
+    if enable_taturtle_alignment:
+        output_folder_path.mkdir(parents=True, exist_ok=True)
+        thickness_corr_folder_path.mkdir(parents=True, exist_ok=True)
+        cropped_folder_path.mkdir(parents=True, exist_ok=True)
 
     start = time.time()
 
@@ -113,153 +115,154 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
     yield {UpdateType.N_IMAGES: n_images}
     displacements = []
 
-    if crop:
-        yield {UpdateType.AUTOCROP: True}
-        x_shift, y_shift = autocrop.run_autocrop(image_folder_path,
-            image_ref,
-            cropped_folder_path
-        )
-        # x_shift is top margin (rows), y_shift is left margin (cols)
-        region = Region(
-            col1=min_x - y_shift,
-            col2=max_x - y_shift,
-            row1=min_y - x_shift,
-            row2=max_y - x_shift,
-        )
+    if enable_taturtle_alignment:
+        if crop:
+            yield {UpdateType.AUTOCROP: True}
+            x_shift, y_shift = autocrop.run_autocrop(image_folder_path,
+                image_ref,
+                cropped_folder_path
+            )
+            # x_shift is top margin (rows), y_shift is left margin (cols)
+            region = Region(
+                col1=min_x - y_shift,
+                col2=max_x - y_shift,
+                row1=min_y - x_shift,
+                row2=max_y - x_shift,
+            )
 
-        image_folder_path = cropped_folder_path
-        image_ref = image_folder_path / image_ref.name
+            image_folder_path = cropped_folder_path
+            image_ref = image_folder_path / image_ref.name
 
-    if not thickness_correction:
-        template = init_templatematching(
-            image_folder_path, 
-            image_ref, 
-            row_range=[region.row1, region.row2], 
-            col_range=[region.col1, region.col2]
-        )
-        patch_prev, prev_x, prev_y, patch_list = unpack_result_template_step1(
-            run_template_matching(
+        if not thickness_correction:
+            template = init_templatematching(
+                image_folder_path, 
+                image_ref, 
+                row_range=[region.row1, region.row2], 
+                col_range=[region.col1, region.col2]
+            )
+            patch_prev, prev_x, prev_y, patch_list = unpack_result_template_step1(
+                run_template_matching(
+                    image_folder_path,
+                    template,
+                    alpha,
+                    search_window,
+                    nr_cpu,
+                ),
+                template.patch_ref,
+                len(template.tiff_files),
+            )
+            results2 = run_template_matching(
                 image_folder_path,
-                template,
+                template_median(template, patch_list),
+                alpha,
+                search_window // 4,
+                nr_cpu,
+            )
+            for i, (pos_x2, pos_y2, _) in enumerate(results2):
+                yield {UpdateType.IMAGE: i + 1}
+                shift_x, shift_y = save_shift_image(
+                    image_folder_path,
+                    output_folder_path,
+                    template.tiff_files[i],
+                    template.init_x,
+                    template.init_y,
+                    pos_x2,
+                    pos_y2,
+                )
+                displacements.append(
+                    f"Slice {i + 1} ({template.tiff_files[i].name}): "
+                    f"Shift X={shift_x}, Shift Y={shift_y}"
+                )
+                logger.info(
+                    f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
+                    f"{shift_x} - {shift_y}",
+                )
+        else:
+            yield {UpdateType.THICKNESS: True}
+            len_input_files, len_slices = run_thickness_correction(
+                image_folder_path,
+                slice_thickness,
+                thickness_corr_folder_path
+            )
+            logger.info(
+                f"Before {len_input_files}, After {len_slices} Thickness correction passed"
+            )
+            yield {UpdateType.N_IMAGES: len_slices}
+            image_folder_path = thickness_corr_folder_path
+            image_ref = image_folder_path / f"{image_ref.stem}_0.tif"
+            if not image_ref.exists():
+                # Fallback to first file if _0 doesn't exist for some reason
+                files = sorted(list(image_folder_path.glob('*.tif*')))
+                if files:
+                    image_ref = files[0]
+            template = init_templatematching(
+                image_folder_path, 
+                image_ref, 
+                row_range=[region.row1, region.row2], 
+                col_range=[region.col1, region.col2]
+            )
+            patch_prev, prev_x, prev_y, patch_list = unpack_result_template_step1(
+                run_template_matching(
+                    image_folder_path,
+                    template,
+                    alpha,
+                    search_window,
+                    nr_cpu,
+                ),
+                template.patch_ref,
+                len(template.tiff_files),
+            )
+            results2 = run_template_matching(
+                image_folder_path,
+                template_median(template, patch_list),
                 alpha,
                 search_window,
                 nr_cpu,
-            ),
-            template.patch_ref,
-            len(template.tiff_files),
-        )
-        results2 = run_template_matching(
-            image_folder_path,
-            template_median(template, patch_list),
-            alpha,
-            search_window // 4,
-            nr_cpu,
-        )
-        for i, (pos_x2, pos_y2, _) in enumerate(results2):
-            yield {UpdateType.IMAGE: i + 1}
-            shift_x, shift_y = save_shift_image(
-                image_folder_path,
-                output_folder_path,
-                template.tiff_files[i],
-                template.init_x,
-                template.init_y,
-                pos_x2,
-                pos_y2,
             )
-            displacements.append(
-                f"Slice {i + 1} ({template.tiff_files[i].name}): "
-                f"Shift X={shift_x}, Shift Y={shift_y}"
-            )
-            logger.info(
-                f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
-                f"{shift_x} - {shift_y}",
-            )
-    else:
-        yield {UpdateType.THICKNESS: True}
-        len_input_files, len_slices = run_thickness_correction(
-            image_folder_path,
-            slice_thickness,
-            thickness_corr_folder_path
-        )
-        logger.info(
-            f"Before {len_input_files}, After {len_slices} Thickness correction passed"
-        )
-        yield {UpdateType.N_IMAGES: len_slices}
-        image_folder_path = thickness_corr_folder_path
-        image_ref = image_folder_path / f"{image_ref.stem}_0.tif"
-        if not image_ref.exists():
-            # Fallback to first file if _0 doesn't exist for some reason
-            files = sorted(list(image_folder_path.glob('*.tif*')))
-            if files:
-                image_ref = files[0]
-        template = init_templatematching(
-            image_folder_path, 
-            image_ref, 
-            row_range=[region.row1, region.row2], 
-            col_range=[region.col1, region.col2]
-        )
-        patch_prev, prev_x, prev_y, patch_list = unpack_result_template_step1(
-            run_template_matching(
-                image_folder_path,
-                template,
-                alpha,
-                search_window,
-                nr_cpu,
-            ),
-            template.patch_ref,
-            len(template.tiff_files),
-        )
-        results2 = run_template_matching(
-            image_folder_path,
-            template_median(template, patch_list),
-            alpha,
-            search_window,
-            nr_cpu,
-        )
-        for i, (pos_x2, pos_y2, _) in enumerate(results2):
-            yield {UpdateType.IMAGE: i + 1}
-            shift_x2, shift_y2 = save_shift_image(
-                image_folder_path,
-                output_folder_path,
-                template.tiff_files[i],
-                template.init_x,
-                template.init_y,
-                pos_x2,
-                pos_y2,
-            )
-            displacements.append(
-                f"Slice {i + 1} ({template.tiff_files[i].name}): "
-                f"Shift X={shift_x2}, Shift Y={shift_y2}"
-            )
-            logger.info(
-                f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
-                f"{shift_x2} - {shift_y2}"
-            )
+            for i, (pos_x2, pos_y2, _) in enumerate(results2):
+                yield {UpdateType.IMAGE: i + 1}
+                shift_x2, shift_y2 = save_shift_image(
+                    image_folder_path,
+                    output_folder_path,
+                    template.tiff_files[i],
+                    template.init_x,
+                    template.init_y,
+                    pos_x2,
+                    pos_y2,
+                )
+                displacements.append(
+                    f"Slice {i + 1} ({template.tiff_files[i].name}): "
+                    f"Shift X={shift_x2}, Shift Y={shift_y2}"
+                )
+                logger.info(
+                    f"Registration displacement ({i + 1}/{len(template.tiff_files)}): "
+                    f"{shift_x2} - {shift_y2}"
+                )
 
-    # Cleanup: Move files from "output" to output_base_path and remove subfolders
-    if output_folder_path.exists():
-        for f in output_folder_path.iterdir():
-            if f.is_file():
-                dest = output_base_path / f.name
-                if dest.exists():
-                    dest.unlink()
-                shutil.move(str(f), str(dest))
-        output_folder_path.rmdir()
+        # Cleanup: Move files from "output" to output_base_path and remove subfolders
+        if output_folder_path.exists():
+            for f in output_folder_path.iterdir():
+                if f.is_file():
+                    dest = output_base_path / f.name
+                    if dest.exists():
+                        dest.unlink()
+                    shutil.move(str(f), str(dest))
+            output_folder_path.rmdir()
 
-    for subfolder in [cropped_folder_path, thickness_corr_folder_path]:
-        if subfolder.exists():
-            shutil.rmtree(subfolder)
+        for subfolder in [cropped_folder_path, thickness_corr_folder_path]:
+            if subfolder.exists():
+                shutil.rmtree(subfolder)
 
-    # Save displacement report
-    if displacements:
-        report_path = output_base_path / "displacements.txt"
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write("Taturtle Alignment Report\n")
-            f.write("=" * 25 + "\n")
-            f.write(f"Reference Image: {image_ref.name}\n")
-            f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write("\n".join(displacements))
-            f.write("\n")
+        # Save displacement report
+        if displacements:
+            report_path = output_base_path / "displacements.txt"
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write("Taturtle Alignment Report\n")
+                f.write("=" * 25 + "\n")
+                f.write(f"Reference Image: {image_ref.name}\n")
+                f.write(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                f.write("\n".join(displacements))
+                f.write("\n")
 
     final_results_path = output_base_path
     if enable_amst2 and amst2_settings:
@@ -279,7 +282,9 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
             
             # Replicating amst_workflow logic to provide progress reporting
             yield {UpdateType.AMST2: (0, "AMST: Loading stack...")}
-            handle, stack_shape = load_data_handle(str(output_base_path))
+            # Use output_base_path if Taturtle was run, otherwise read from original image_folder_path
+            input_for_amst = output_base_path if enable_taturtle_alignment else image_folder_path
+            handle, stack_shape = load_data_handle(str(input_for_amst))
             
             yield {UpdateType.AMST2: (0, "AMST: Computing median template...")}
             # Compute median smoothed template (mst)
@@ -345,7 +350,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
             refinement_folder = output_base_path / "refinement"
             refinement_folder.mkdir(parents=True, exist_ok=True)
             apply_multi_step_stack_alignment_workflow(
-                image_stack=str(output_base_path),
+                image_stack=str(input_for_amst),
                 transform_paths=[str(amst_transform_path)],
                 out_filepath=str(refinement_folder),
                 auto_pad=True,
@@ -353,6 +358,16 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 write_result=True
             )
             final_results_path = refinement_folder
+            # Copy refined images back to the main output folder for easy access
+            if refinement_folder.exists():
+                for f in refinement_folder.iterdir():
+                    if f.is_file():
+                        dest = output_base_path / f.name
+                        if dest.exists():
+                            dest.unlink()
+                        shutil.move(str(f), str(dest))
+                # Optionally keep refinement folder for reference
+                # shutil.rmtree(refinement_folder)  # Uncomment to clean up
         finally:
             if os.path.exists(tmp_params_path):
                 try:
@@ -453,6 +468,7 @@ class ProcessWidget(QWidget):
         self.training_param_group.setMinimumWidth(100)
 
         self._layer_combo = create_widget(annotation=napari.layers.Shapes)
+        self._enable_taturtle_alignment = create_widget(annotation=bool, value=True)
         self._enable_crop = create_widget(annotation=bool)
         self._enable_thickness_correction = create_widget(annotation=bool)
         self._search_windows  = create_widget(annotation=int, widget_type='SpinBox', value=100, label='Search Window')
@@ -489,6 +505,7 @@ class ProcessWidget(QWidget):
         self._params_form.addRow('Rectangle Layer', self._layer_combo.native)
         self._params_form.addRow('', nav_layout)
         self._params_form.addRow('Output Folder', self._output_folder)
+        self._params_form.addRow('Run Taturtle Alignment', self._enable_taturtle_alignment.native)
         self._params_form.addRow('Crop', self._enable_crop.native)
         self._params_form.addRow('Thickness correction', self._enable_thickness_correction.native)
         self._params_form.addRow('Slice Thickness', self._slice_thickness.native)
@@ -583,12 +600,28 @@ class ProcessWidget(QWidget):
         self._prev_button.clicked.connect(self._prev_slice)
         self._next_button.clicked.connect(self._next_slice)
         self._slice_spinbox.valueChanged.connect(self._on_spinbox_changed)
+        self._enable_taturtle_alignment.changed.connect(self._update_taturtle_visibility)
         self._enable_thickness_correction.changed.connect(self._update_thickness_visibility)
         # Sync initial state
+        self._update_taturtle_visibility()
+        self._update_thickness_visibility()
+
+    def _update_taturtle_visibility(self, event=None):
+        visible = self._enable_taturtle_alignment.value
+        self._enable_crop.native.setVisible(visible)
+        self._enable_thickness_correction.native.setVisible(visible)
+        self._search_windows.native.setVisible(visible)
+        
+        # update labels
+        for widget in [self._enable_crop.native, self._enable_thickness_correction.native, self._search_windows.native]:
+            label = self._params_form.labelForField(widget)
+            if label:
+                label.setVisible(visible)
+        
         self._update_thickness_visibility()
 
     def _update_thickness_visibility(self, event=None):
-        visible = self._enable_thickness_correction.value
+        visible = self._enable_thickness_correction.value and self._enable_taturtle_alignment.value
         self._slice_thickness.native.setVisible(visible)
         label = self._params_form.labelForField(self._slice_thickness.native)
         if label:
@@ -718,21 +751,30 @@ class ProcessWidget(QWidget):
             'radius': self._amst2_median_radius.value()
         }
 
+        enable_taturtle_alignment = self._enable_taturtle_alignment.value
+
+        if not enable_taturtle_alignment and not enable_amst2:
+            ntf.show_info("Please enable at least Taturtle Alignment or AMST Refinement.")
+            return
+
         layer_shape= self._layer_combo.value
 
-        if layer_shape.data is None or len(layer_shape.data) != 1:
+        if enable_taturtle_alignment and (layer_shape.data is None or len(layer_shape.data) != 1):
             ntf.show_info("Please select a shape layer with 1 rectangle shape to define the region.")
             return
         
-        coordinate_region = layer_shape.data[0]
+        if enable_taturtle_alignment:
+            coordinate_region = layer_shape.data[0]
 
-        min_y, min_x = coordinate_region.min(axis=0)  # napari is (y, x)
-        max_y, max_x = coordinate_region.max(axis=0)
+            min_y, min_x = coordinate_region.min(axis=0)  # napari is (y, x)
+            max_y, max_x = coordinate_region.max(axis=0)
 
-        min_y = int(min_y)
-        min_x = int(min_x)
-        max_y = int(max_y)
-        max_x = int(max_x)
+            min_y = int(min_y)
+            min_x = int(min_x)
+            max_y = int(max_y)
+            max_x = int(max_x)
+        else:
+            min_y, min_x, max_y, max_x = 0, 0, 0, 0
 
         image_folder_path = Path(self.images_folder.get_folder())
         if not self.image_files:
@@ -756,7 +798,7 @@ class ProcessWidget(QWidget):
             min_x, max_x, min_y, max_y, image_folder_path, 
             image_reference_path, crop, thickness_correction, alpha,
             search_window, nr_cpu, slice_thickness, output_base_path,
-            enable_amst2, amst2_settings
+            enable_amst2, amst2_settings, enable_taturtle_alignment
         )
         
         self.worker.yielded.connect(lambda x: self._update(x))
