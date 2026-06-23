@@ -2,6 +2,9 @@
 
 A napari plugin for FIB-SEM image alignment and preprocessing, powered by the `taturtle` package.
 
+<img width="1918" height="1029" alt="image" src="https://github.com/user-attachments/assets/64501395-6cf8-4893-9ce7-08a8488fcc7b" />
+
+
 ## Features
 - **Autocrop**: Automatically remove black borders from aligned stacks.
 - **Registration**: High-precision image registration using template matching.
@@ -10,15 +13,23 @@ A napari plugin for FIB-SEM image alignment and preprocessing, powered by the `t
 
 ## Installation
 
-### 1. Create the Conda Environment
+### 0. Install Conda
+Install conda like with [miniforge](https://github.com/conda-forge/miniforge) or others
+
+### 1. Clone the project
+
+```bash
+git clone https://github.com/vib-bic-code/napari-taturtle-plugin.git
+cd napari-taturtle-plugin
+```
+
+### 2. Create the Conda Environment
 Using the provided `environment.yml` file:
 
 ```bash
 conda env create -f environment.yml
 conda activate napari-taturtle-env
 ```
-
-### 2. Clone the project
 
 ### 3. Install the Plugin in Editable Mode
 From the root of this project directory:
