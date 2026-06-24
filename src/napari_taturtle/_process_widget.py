@@ -353,7 +353,7 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                 image_stack=str(input_for_amst),
                 transform_paths=[str(amst_transform_path)],
                 out_filepath=str(refinement_folder),
-                auto_pad=True,
+                auto_pad=False,
                 n_workers=nr_cpu,
                 write_result=True
             )
