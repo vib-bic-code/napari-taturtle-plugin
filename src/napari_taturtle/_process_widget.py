@@ -63,6 +63,9 @@ from napari.qt.threading import thread_worker
 from napari_taturtle.utils.taturtle_utils import UpdateType
 from napari_taturtle.utils.visualization import plot_displacements
 
+
+import tifffile
+
 logger = logging.getLogger(__name__)
 
 SAMPLE = 'Sample data'
@@ -73,8 +76,10 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                     image_ref, crop, thickness_correction, alpha,
                     search_window, nr_cpu, slice_thickness, output_base_path,
                     enable_amst2=False, amst2_settings=None,
-                    enable_taturtle_alignment=True):
+                    enable_taturtle_alignment=True,
+                    save_as_stack=False):
     import shutil
+    generated_files = []
     import tempfile
     from squirrel.workflows.elastix import (
         make_elastix_default_parameter_file_workflow,
@@ -247,6 +252,8 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                     if dest.exists():
                         dest.unlink()
                     shutil.move(str(f), str(dest))
+                    if dest.suffix.lower() in ('.tif', '.tiff'):
+                        generated_files.append(dest)
             output_folder_path.rmdir()
 
         for subfolder in [cropped_folder_path, thickness_corr_folder_path]:
@@ -360,12 +367,15 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
             final_results_path = refinement_folder
             # Copy refined images back to the main output folder for easy access
             if refinement_folder.exists():
+                generated_files = []  # Reset generated_files because AMST refined files replace the previous ones!
                 for f in refinement_folder.iterdir():
                     if f.is_file():
                         dest = output_base_path / f.name
                         if dest.exists():
                             dest.unlink()
                         shutil.move(str(f), str(dest))
+                        if dest.suffix.lower() in ('.tif', '.tiff'):
+                            generated_files.append(dest)
                 # Optionally keep refinement folder for reference
                 # shutil.rmtree(refinement_folder)  # Uncomment to clean up
         finally:
@@ -374,6 +384,35 @@ def _process_worker(min_x, max_x, min_y, max_y, image_folder_path,
                     os.remove(tmp_params_path)
                 except:
                     pass
+
+    if save_as_stack and generated_files:
+        yield {UpdateType.AMST2: (0, "Saving as TIFF stack...")}
+        stack_file_path = output_base_path / f"{image_folder_path.name}_registered_stack.tif"
+        if stack_file_path.exists():
+            try:
+                stack_file_path.unlink()
+            except Exception as e:
+                logger.warning(f"Could not delete existing stack file {stack_file_path}: {e}")
+        
+        # Sort generated files so they are added to the stack in order
+        generated_files = sorted(generated_files, key=lambda p: p.name)
+        
+        with tifffile.TiffWriter(stack_file_path) as stack:
+            for idx, f in enumerate(generated_files):
+                img = tifffile.imread(f)
+                stack.write(img, metadata={'axes': 'ZYX'}, contiguous=True)
+                perc = int(100 * (idx + 1) / len(generated_files))
+                yield {UpdateType.AMST2: (perc, f"Saving stack: slice {idx+1}/{len(generated_files)}")}
+        
+        # Delete the individual files we just stacked
+        for f in generated_files:
+            try:
+                f.unlink()
+            except Exception as e:
+                logger.warning(f"Could not delete individual file {f}: {e}")
+        final_results_path = stack_file_path
+    else:
+        final_results_path = output_base_path
 
     elapsed_time = time.time() - start
     yield {UpdateType.DONE}
@@ -475,6 +514,7 @@ class ProcessWidget(QWidget):
         self._slice_thickness  = create_widget(annotation=int, widget_type='FloatSpinBox', value=1.0, label='Slice Thickness')
         self._nr_cpu  = create_widget(annotation=int, widget_type='SpinBox', value=max(1, os.cpu_count() - 4), label='Nr CPU')
         self._output_folder = FolderWidget('Choose Output')
+        self._save_as_stack = QCheckBox("Save as TIFF stack")
 
         # Navigation buttons
         self._prev_button = QPushButton('⏴')
@@ -505,6 +545,7 @@ class ProcessWidget(QWidget):
         self._params_form.addRow('Rectangle Layer', self._layer_combo.native)
         self._params_form.addRow('', nav_layout)
         self._params_form.addRow('Output Folder', self._output_folder)
+        self._params_form.addRow('', self._save_as_stack)
         self._params_form.addRow('Run Taturtle Alignment', self._enable_taturtle_alignment.native)
         self._params_form.addRow('Crop', self._enable_crop.native)
         self._params_form.addRow('Thickness correction', self._enable_thickness_correction.native)
@@ -794,11 +835,15 @@ class ProcessWidget(QWidget):
         else:
             output_base_path = image_folder_path.parent
 
+        save_as_stack = self._save_as_stack.isChecked()
+
         self.worker = _process_worker(
             min_x, max_x, min_y, max_y, image_folder_path, 
             image_reference_path, crop, thickness_correction, alpha,
             search_window, nr_cpu, slice_thickness, output_base_path,
-            enable_amst2, amst2_settings, enable_taturtle_alignment
+            enable_amst2=enable_amst2, amst2_settings=amst2_settings,
+            enable_taturtle_alignment=enable_taturtle_alignment,
+            save_as_stack=save_as_stack
         )
         
         self.worker.yielded.connect(lambda x: self._update(x))
@@ -885,11 +930,14 @@ class ProcessWidget(QWidget):
             )
             
             if load_results == QMessageBox.Yes:
-                files = [str(f) for f in sorted(results_path.glob("*.tif*"))]
-                if files:
-                    self.viewer.open(files, stack=True)
+                if results_path.is_file():
+                    self.viewer.open(str(results_path))
                 else:
-                    ntf.show_info("No result images found in the output folder.")
+                    files = [str(f) for f in sorted(results_path.glob("*.tif*"))]
+                    if files:
+                        self.viewer.open(files, stack=True)
+                    else:
+                        ntf.show_info("No result images found in the output folder.")
 
     def set_layer(self, layer):
         self.images.choices = [x for x in self.viewer.layers if type(x) is napari.layers.Image]
