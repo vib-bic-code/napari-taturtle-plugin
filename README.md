@@ -54,3 +54,58 @@ pip install -e .
 
 ## License
 Distributed under the terms of the BSD-3 license.
+
+## Extra:
+
+You can now perform extra filtering using squirrel, those could be addded to the plugin:
+
+Her is how it's working with squirrel:
+
+1. Create a parameter file that defines the filter sequence, here a quite detailed example that I used on some cryoFIB-SEM data:
+ ```bash
+echo '[
+    ["vsnr", {"is_gpu": false, "maxit": 20, "keep_zeros": true,
+"filters": [{"name": "Gabor", "sigma": [2, 35], "theta": 0,
+"noise_level": 0.5}]}],
+    ["vsnr", {"is_gpu": false, "maxit": 20, "keep_zeros": true,
+"filters": [{"name": "Gabor", "sigma": [2, 35], "theta": 90,
+"noise_level": 0.5}]}],
+    ["median", {"radius": [5, 200], "filter_mode": "subtract",
+"cast_dtype": "uint16", "sample_footprint": 200, "elliptical_footprint":
+true, "keep_zeros": true}],
+    ["median", {"radius": [300, 5], "filter_mode": "subtract",
+"cast_dtype": "uint16", "sample_footprint": 200, "elliptical_footprint":
+true, "keep_zeros": true}],
+    ["clahe", {"tile_grid_in_pixels": true, "tile_grid_size": [127, 127], "clip_limit": 40, "keep_zeros": true}] ]' >> filters.json
+ ```
+ 
+2. Run for a test slice:
+```bash 
+sq-image-filter_2d_workflow image.tif output.tif -ff filters.json
+```
+ 
+3. Run for the full dataset:
+```bash 
+sq-stack-filter_2d_workflow dataset_dir/ output_dir/ -ff filters.json --batch_size 16 --n_workers 16
+``` 
+ 
+Also check out the `-h` output of the `sq-stack-filter_2d_workflow` function.
+ 
+ 
+If you only want to de-stripe the horizontal stripes, you could simply use:
+```bash 
+echo '[
+    ["vsnr", {"is_gpu": false, "maxit": 20, "keep_zeros": true,
+"filters": [{"name": "Gabor", "sigma": [2, 35], "theta": 0,
+"noise_level": 0.5}]}]
+]' >> filters.json
+sq-stack-filter_2d_workflow dataset_dir/ output_dir/ -ff filters.json
+--batch_size 16 --n_workers 16
+```
+It could be that you can improve results with adjusting, `theta` (the
+angle of the stripes, 0 means exactly vertical), `sigma` or
+`noise_level`. More theory on the VSNR algorithm here: https://github.com/CEA-MetroCarac/pyvsnr
+ 
+Note: the "keep_zeros" parameters is available for any filter and makes
+sure that pixels that are zero in the input image will be zero in the
+output as well (it's usually good to keep the background).
